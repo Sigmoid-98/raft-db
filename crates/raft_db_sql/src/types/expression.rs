@@ -1,9 +1,9 @@
-use regex::Regex;
-use serde::{Deserialize, Serialize};
-use raft_db_common::{errinput, RaftDBResult};
 use crate::planner::Node;
 use crate::types;
 use crate::types::{Label, Row, Value};
+use raft_db_common::{RaftDBResult, errinput};
+use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 /// An expression, made up of nested operations and values. Values are either
 /// constants or dynamic column references. Evaluates to a final value during
@@ -76,7 +76,6 @@ impl Expression {
     /// Formats the expression, using the given plan node to look up labels for
     /// numeric column references.
     pub fn format(&self, node: &Node) -> String {
-
         // Precedence levels, for grouping. Matches the parser precedence.
         fn precedence(expr: &Expression) -> u8 {
             use types::Expression::*;
@@ -103,7 +102,7 @@ impl Expression {
             }
             string
         };
-        
+
         match self {
             Expression::Constant(value) => format!("{value}"),
             Expression::Column(index) => match node.column_label(*index) {
@@ -119,7 +118,9 @@ impl Expression {
             Expression::GreaterThan(lhs, rhs) => format!("{} > {}", format(lhs), format(rhs)),
             Expression::LessThan(lhs, rhs) => format!("{} < {}", format(lhs), format(rhs)),
             Expression::Is(expr, Value::Null) => format!("{} IS NULL", format(expr)),
-            Expression::Is(expr, Value::Float(f)) if f.is_nan() => format!("{} IS NAN", format(expr)),
+            Expression::Is(expr, Value::Float(f)) if f.is_nan() => {
+                format!("{} IS NAN", format(expr))
+            }
             Expression::Is(_, v) => panic!("unexpected IS value {v}"),
 
             Expression::Add(lhs, rhs) => format!("{} + {}", format(lhs), format(rhs)),
@@ -288,7 +289,7 @@ impl Expression {
             return false;
         }
         match self {
-            | Self::Add(lhs, rhs)
+            Self::Add(lhs, rhs)
             | Self::And(lhs, rhs)
             | Self::Divide(lhs, rhs)
             | Self::Equal(lhs, rhs)
@@ -301,7 +302,7 @@ impl Expression {
             | Self::Remainder(lhs, rhs)
             | Self::Subtract(lhs, rhs) => lhs.walk(visitor) && rhs.walk(visitor),
 
-            | Self::Factorial(expr)
+            Self::Factorial(expr)
             | Self::Identity(expr)
             | Self::Is(expr, _)
             | Self::Negate(expr)
@@ -358,5 +359,162 @@ impl Expression {
         };
         self = after(self)?;
         Ok(self)
+    }
+
+    /// Converts the expression into conjunctive normal form, i.e. an AND of
+    /// ORs, which is useful when optimizing plans. This is done by converting
+    /// to negation normal form and then applying De Morgan's distributive law.
+    pub fn into_cnf(self) -> Self {
+        let xform = |expr| {
+            // We can't use a single match, since it needs deref patterns.
+            let Expression::Or(lhs, rhs) = expr else {
+                return expr;
+            };
+            match (*lhs, *rhs) {
+                // (x AND y) OR z → (x OR z) AND (y OR z)
+                (Expression::And(l, r), rhs) => Expression::And(
+                    Expression::Or(l, rhs.clone().into()).into(),
+                    Expression::Or(r, rhs.into()).into(),
+                ),
+                // x OR (y AND z) → (x OR y) AND (x OR z)
+                (lhs, Expression::And(l, r)) => Expression::And(
+                    Expression::Or(lhs.clone().into(), l).into(),
+                    Expression::Or(lhs.into(), r).into(),
+                ),
+                // Otherwise, do nothing.
+                (lhs, rhs) => Expression::Or(lhs.into(), rhs.into()),
+            }
+        };
+        self.into_nnf().transform(&|e| Ok(xform(e)), &Ok).unwrap() // infallible
+    }
+
+    /// Converts the expression into negation normal form. This pushes NOT
+    /// operators into the tree using De Morgan's laws, such that they're always
+    /// below other logical operators. It is a useful intermediate form for
+    /// applying other logical normalizations.
+    pub fn into_nnf(self) -> Self {
+        let xform = |expr| {
+            let Expression::Not(inner) = expr else {
+                return expr;
+            };
+            match *inner {
+                // NOT (x AND y) → (NOT x) OR (NOT y)
+                Expression::And(lhs, rhs) => {
+                    Expression::Or(Expression::Not(lhs).into(), Expression::Not(rhs).into())
+                }
+                // NOT (x OR y) → (NOT x) AND (NOT y)
+                Expression::Or(lhs, rhs) => {
+                    Expression::And(Expression::Not(lhs).into(), Expression::Not(rhs).into())
+                }
+                // NOT NOT x → x
+                Expression::Not(inner) => *inner,
+                // Otherwise, do nothing.
+                expr => Expression::Not(expr.into()),
+            }
+        };
+        self.transform(&|e| Ok(xform(e)), &Ok).unwrap() // never fails
+    }
+
+    /// Converts the expression into conjunctive normal form as a vector of
+    /// ANDed expressions (instead of nested ANDs).
+    pub fn into_cnf_vec(self) -> Vec<Self> {
+        let mut cnf = Vec::new();
+        let mut stack = vec![self.into_cnf()];
+        while let Some(expr) = stack.pop() {
+            if let Self::And(lhs, rhs) = expr {
+                stack.extend([*rhs, *lhs]); // push lhs last to pop it first
+            } else {
+                cnf.push(expr);
+            }
+        }
+        cnf
+    }
+
+    /// Creates an expression by ANDing together a vector, or None if empty.
+    pub fn and_vec(exprs: Vec<Expression>) -> Option<Self> {
+        let mut iter = exprs.into_iter();
+        let mut expr = iter.next()?;
+        for rhs in iter {
+            expr = Expression::And(expr.into(), rhs.into());
+        }
+        Some(expr)
+    }
+
+    /// Checks if an expression is a single column lookup (i.e. a disjunction of
+    /// = or IS NULL/NAN for a single column), returning the column index.
+    pub fn is_column_lookup(&self) -> Option<usize> {
+        match &self {
+            // Column/constant equality can use index lookups. NULL and NaN are
+            // handled in into_column_values().
+            Expression::Equal(lhs, rhs) => match (lhs.as_ref(), rhs.as_ref()) {
+                (Expression::Column(c), Expression::Constant(_))
+                | (Expression::Constant(_), Expression::Column(c)) => Some(*c),
+                _ => None,
+            },
+            // IS NULL and IS NAN can use index lookups.
+            Expression::Is(expr, _) => match expr.as_ref() {
+                Expression::Column(c) => Some(*c),
+                _ => None,
+            },
+            // All OR branches must be lookups on the same column:
+            // id = 1 OR id = 2 OR id = 3.
+            Expression::Or(lhs, rhs) => match (lhs.is_column_lookup(), rhs.is_column_lookup()) {
+                (Some(l), Some(r)) if l == r => Some(l),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Extracts column lookup values for the given column. Panics if the
+    /// expression isn't a lookup of the given column, i.e. is_column_lookup()
+    /// must return true for the expression.
+    pub fn into_column_values(self, index: usize) -> Vec<Value> {
+        match self {
+            Expression::Equal(lhs, rhs) => match (*lhs, *rhs) {
+                (Expression::Column(column), Expression::Constant(value))
+                | (Expression::Constant(value), Expression::Column(column)) => {
+                    assert_eq!(column, index, "unexpected column");
+                    // NULL and NAN index lookups are for IS NULL and IS NAN.
+                    // Equality shouldn't match anything, return empty vec.
+                    if value.is_undefined() { Vec::new() } else { vec![value] }
+                }
+                (lhs, rhs) => {
+                    panic!("unexpected expression {:?}", Expression::Equal(lhs.into(), rhs.into()))
+                }
+            },
+            // IS NULL and IS NAN can use index lookups.
+            Expression::Is(expr, value) => match *expr {
+                Expression::Column(column) => {
+                    assert_eq!(column, index, "unexpected column");
+                    vec![value]
+                }
+                expr => panic!("unexpected expression {expr:?}"),
+            },
+            Expression::Or(lhs, rhs) => {
+                let mut values = lhs.into_column_values(index);
+                values.extend(rhs.into_column_values(index));
+                values
+            }
+            expr => panic!("unexpected expression {expr:?}"),
+        }
+    }
+
+    /// Replaces column references with the given column.
+    pub fn replace_column(self, from: usize, to: usize) -> Self {
+        let xform = |expr| match expr {
+            Expression::Column(i) if i == from => Expression::Column(to),
+            expr => expr,
+        };
+        self.transform(&|e| Ok(xform(e)), &Ok).unwrap() // infallible
+    }
+
+    /// Shifts column references by the given amount.
+    pub fn shift_column(self, diff: isize) -> Self {
+        let xform = |expr| match expr {
+            Expression::Column(i) => Expression::Column((i as isize + diff) as usize),
+            expr => expr,
+        };
+        self.transform(&|e| Ok(xform(e)), &Ok).unwrap() // infallible
     }
 }

@@ -7,6 +7,9 @@ use crate::parser::ast;
 use crate::planner::Planner;
 use crate::types::{Expression, Label, Table, Value};
 use itertools::Itertools as _;
+use crate::execution;
+use crate::execution::ExecutionResult;
+use crate::planner::optimizer::OPTIMIZERS;
 
 pub enum Plan {
     /// A CREATE TABLE plan. Creates a new table with the given schema. Errors
@@ -66,7 +69,28 @@ impl Plan {
         Planner::new(catalog).build(statement)
     }
     
-    pub fn execute(self, txn: &(impl Transaction + Catalog)) -> RaftDBResult<Ex> {}
+    pub fn execute(self, txn: &(impl Transaction + Catalog)) -> RaftDBResult<ExecutionResult> {
+        execution::execute_plan(self, txn, txn)
+    }
+
+    /// Optimizes the plan, consuming it. See OPTIMIZERS for the list of
+    /// optimizers.
+    pub fn optimize(self) -> RaftDBResult<Self> {
+        let optimize = |node| OPTIMIZERS.iter().try_fold(node, |node, (_, opt)| opt(node));
+        Ok(match self {
+            Self::CreateTable { .. } | Self::DropTable { .. } => self,
+            Self::Delete { table, primary_key, source } => {
+                Self::Delete { table, primary_key, source: optimize(source)? }
+            }
+            Self::Insert { table, column_map, source } => {
+                Self::Insert { table, column_map, source: optimize(source)? }
+            }
+            Self::Update { table, primary_key, source, expressions } => {
+                Self::Update { table, primary_key, source: optimize(source)?, expressions }
+            }
+            Self::Select(root) => Self::Select(optimize(root)?),
+        })
+    }
 }
 
 
@@ -544,7 +568,8 @@ impl From<ast::Direction> for Direction {
     }
 }
 
-
+/// Inverts a Remap targets vector to a vector of source indexes, with None
+/// for columns that weren't targeted.
 pub fn remap_sources(targets: &[Option<usize>]) -> Vec<Option<usize>> {
     let size = targets.iter().filter_map(|v| *v).map(|i| i + 1).max().unwrap_or(0);
     let mut sources = vec![None; size];

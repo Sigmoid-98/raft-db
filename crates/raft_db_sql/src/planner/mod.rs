@@ -3,6 +3,7 @@
 
 mod plan;
 mod planner;
+mod optimizer;
 
 pub use plan::{Aggregate, Direction, Node, Plan};
 pub use planner::{Planner, Scope};

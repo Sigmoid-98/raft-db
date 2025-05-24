@@ -6,3 +6,5 @@ mod join;
 mod transform;
 mod write;
 mod source;
+
+pub use execute::{ExecutionResult, execute_plan};

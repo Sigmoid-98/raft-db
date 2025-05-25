@@ -1,9 +1,11 @@
-use std::collections::{HashMap, HashSet};
-use raft_db_common::{errinput, RaftDBResult};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use itertools::{Either, Itertools as _};
+use raft_db_common::{errinput, RaftDBError, RaftDBResult};
 use crate::engine::Catalog;
 use crate::parser::ast;
+use crate::planner::{Aggregate, Node};
 use crate::planner::plan::{remap_sources, Plan};
-use crate::types::{self, Table};
+use crate::types::{self, Column, Expression, Label, Table, Value};
 
 
 /// The planner builds an execution plan from a parsed Abstract Syntax Tree,
@@ -21,17 +23,461 @@ impl<'a, C: Catalog> Planner<'a, C> {
     /// Builds a plan for an AST statement.
     pub fn build(&mut self, statement: ast::Statement) -> RaftDBResult<Plan> {
         match statement {
-            ast::Statement::CreateTable { name, columns } => self
-            ast::Statement::Begin { .. } => {}
-            ast::Statement::Commit => {}
-            ast::Statement::Rollback => {}
-            ast::Statement::Explain(_) => {}
-            ast::Statement::DropTable { .. } => {}
-            ast::Statement::Delete { .. } => {}
-            ast::Statement::Insert { .. } => {}
-            ast::Statement::Update { .. } => {}
-            ast::Statement::Select { .. } => {}
+            ast::Statement::CreateTable { name, columns } => self.build_create_table(name, columns),
+            ast::Statement::DropTable { name, if_exists } => Ok(Plan::DropTable { table: name, if_exists }),
+            ast::Statement::Delete { table, r#where } => self.build_delete(table, r#where),
+            ast::Statement::Insert { table, columns, values } => self.build_insert(table, columns, values),
+            ast::Statement::Update { table, set, r#where } => self.build_update(table, set, r#where),
+            ast::Statement::Select { select, from, r#where, group_by, having, order_by, offset, limit } => {
+                self.build_select(select, from, r#where, group_by, having, order_by, offset, limit)
+            }
+            // Transaction and explain statements are handled by Session.
+            | ast::Statement::Begin { .. }
+            | ast::Statement::Commit
+            | ast::Statement::Rollback
+            | ast::Statement::Explain(_) => panic!("unexpected statement {statement:?}"),
         }
+    }
+
+    /// Builds a CREATE TABLE plan.
+    fn build_create_table(&self, name: String, columns: Vec<ast::Column>) -> RaftDBResult<Plan> {
+        // Most schema validation happens during execution via Table.validate().
+        // However, the AST specifies the primary key as a column field, while
+        // the schema stores it as a column index, so we have to map that here.
+        let Some(primary_key) = columns.iter().position(|c| c.primary_key) else {
+            return errinput!("no primary key for table {name}");
+        };
+        if columns.iter().filter(|c| c.primary_key).count() > 1 {
+            return errinput!("multiple primary keys for table {name}");
+        }
+        let columns = columns
+            .into_iter()
+            .map(|c| {
+                let nullable = c.nullable.unwrap_or(!c.primary_key);
+                Ok(Column {
+                    name: c.name,
+                    datatype: c.datatype,
+                    nullable,
+                    default: match c.default {
+                        Some(expr) => Some(Self::evaluate_constant(expr)?),
+                        None if nullable => Some(Value::Null),
+                        None => None,
+                    },
+                    unique: c.unique || c.primary_key,
+                    index: (c.index || c.unique || c.references.is_some()) && !c.primary_key,
+                    references: c.references,
+                })
+            })
+            .collect::<RaftDBResult<_>>()?;
+        Ok(Plan::CreateTable { schema: Table { name, primary_key, columns } })
+    }
+
+    /// Builds a DELETE plan.
+    fn build_delete(&self, table: String, r#where: Option<ast::Expression>) -> RaftDBResult<Plan> {
+        let table = self.catalog.must_get_table(&table)?;
+        let scope = Scope::from_table(&table)?;
+        let filter = r#where.map(|expr| Self::build_expression(expr, &scope)).transpose()?;
+        Ok(Plan::Delete {
+            table: table.name.clone(),
+            primary_key: table.primary_key,
+            source: Node::Scan { table, alias: None, filter },
+        })
+    }
+
+    /// Builds an INSERT plan.
+    fn build_insert(
+        &self,
+        table: String,
+        columns: Option<Vec<String>>,
+        values: Vec<Vec<ast::Expression>>,
+    ) -> RaftDBResult<Plan> {
+        let table = self.catalog.must_get_table(&table)?;
+        let mut column_map = None;
+        if let Some(columns) = columns {
+            let column_map = column_map.insert(HashMap::new());
+            for (vidx, name) in columns.into_iter().enumerate() {
+                let Some(cidx) = table.columns.iter().position(|c| c.name == name) else {
+                    return errinput!("unknown column {name} in table {}", table.name);
+                };
+                if column_map.insert(cidx, vidx).is_some() {
+                    return errinput!("column {name} given multiple times");
+                }
+            }
+        }
+        let scope = Scope::new();
+        let rows = values
+            .into_iter()
+            .map(|exprs| {
+                exprs.into_iter().map(|expr| Self::build_expression(expr, &scope)).collect()
+            })
+            .try_collect()?;
+        Ok(Plan::Insert { table, column_map, source: Node::Values { rows } })
+    }
+
+    /// Builds an UPDATE plan.
+    fn build_update(
+        &self,
+        table: String,
+        set: BTreeMap<String, Option<ast::Expression>>,
+        r#where: Option<ast::Expression>,
+    ) -> RaftDBResult<Plan> {
+        let table = self.catalog.must_get_table(&table)?;
+        let scope = Scope::from_table(&table)?;
+        let filter = r#where.map(|expr| Self::build_expression(expr, &scope)).transpose()?;
+        let mut expressions = Vec::with_capacity(set.len());
+        for (column, expr) in set {
+            let index = scope.lookup_column(None, &column)?;
+            let expr = match expr {
+                Some(expr) => Self::build_expression(expr, &scope)?,
+                None => match &table.columns[index].default {
+                    Some(default) => Expression::Constant(default.clone()),
+                    None => return errinput!("column {column} has no default value"),
+                },
+            };
+            expressions.push((index, expr));
+        }
+        Ok(Plan::Update {
+            table: table.clone(),
+            primary_key: table.primary_key,
+            source: Node::Scan { table, alias: None, filter },
+            expressions,
+        })
+    }
+
+    /// Builds a SELECT plan.
+    #[allow(clippy::too_many_arguments)]
+    fn build_select(
+        &self,
+        mut select: Vec<(ast::Expression, Option<String>)>,
+        from: Vec<ast::From>,
+        r#where: Option<ast::Expression>,
+        group_by: Vec<ast::Expression>,
+        having: Option<ast::Expression>,
+        order_by: Vec<(ast::Expression, ast::Direction)>,
+        offset: Option<ast::Expression>,
+        limit: Option<ast::Expression>,
+    ) -> RaftDBResult<Plan> {
+        let mut scope = Scope::new();
+
+        // Build FROM clause.
+        let mut node = if !from.is_empty() {
+            self.build_from_clause(from, &mut scope)?
+        } else {
+            // For a constant SELECT, emit a single empty row to project with.
+            // This allows using aggregate functions and WHERE as normal.
+            Node::Values { rows: vec![vec![]] }
+        };
+
+        // Expand out SELECT * to all FROM columns if there are multiple SELECT
+        // expressions or a GROUP BY clause (to ensure all columns are in GROUP
+        // BY). For simplicity, expressions only supports scalar values, so we
+        // special-case the * tuple here.
+        if select.contains(&(ast::Expression::All, None)) {
+            if node.columns() == 0 {
+                return errinput!("SELECT * requires a FROM clause");
+            }
+            if select.len() > 1 || !group_by.is_empty() {
+                select = select
+                    .into_iter()
+                    .flat_map(|(expr, alias)| match expr {
+                        ast::Expression::All => Either::Left(
+                            (0..node.columns()).map(|i| (node.column_label(i).into(), None)),
+                        ),
+                        expr => Either::Right(std::iter::once((expr, alias))),
+                    })
+                    .collect();
+            }
+        }
+
+        // Build WHERE clause.
+        if let Some(r#where) = r#where {
+            let predicate = Self::build_expression(r#where, &scope)?;
+            node = Node::Filter { source: Box::new(node), predicate };
+        }
+
+        // Build aggregate functions and GROUP BY clause.
+        let aggregates = Self::collect_aggregates(&select, &having, &order_by);
+        if !group_by.is_empty() || !aggregates.is_empty() {
+            node = self.build_aggregate(node, group_by, aggregates, &mut scope)?;
+        }
+
+        // Build SELECT clause. We can omit this for a trivial SELECT *.
+        if select.as_slice() != [(ast::Expression::All, None)] {
+            // Prepare the post-projection scope.
+            let mut child_scope = scope.project(&select);
+
+            // Build the SELECT column expressions and aliases.
+            let mut expressions = Vec::with_capacity(select.len());
+            let mut aliases = Vec::with_capacity(select.len());
+            for (expr, alias) in select {
+                expressions.push(Self::build_expression(expr, &scope)?);
+                aliases.push(Label::from(alias));
+            }
+
+            // Add hidden columns for HAVING and ORDER BY columns not in SELECT.
+            let hidden = self.build_select_hidden(&having, &order_by, &scope, &mut child_scope);
+            aliases.extend(std::iter::repeat(Label::None).take(hidden.len()));
+            expressions.extend(hidden);
+
+            scope = child_scope;
+            node = Node::Projection { source: Box::new(node), expressions, aliases };
+        }
+
+        // Build HAVING clause.
+        if let Some(having) = having {
+            if scope.aggregates.is_empty() {
+                return errinput!("HAVING requires GROUP BY or aggregate function");
+            }
+            let predicate = Self::build_expression(having, &scope)?;
+            node = Node::Filter { source: Box::new(node), predicate };
+        }
+
+        // Build ORDER BY clause.
+        if !order_by.is_empty() {
+            let key = order_by
+                .into_iter()
+                .map(|(expr, dir)| Ok((Self::build_expression(expr, &scope)?, dir.into())))
+                .collect::<RaftDBResult<_>>()?;
+            node = Node::Order { source: Box::new(node), key };
+        }
+
+        // Build OFFSET clause.
+        if let Some(offset) = offset {
+            let offset = match Self::evaluate_constant(offset)? {
+                Value::Integer(offset) if offset >= 0 => offset as usize,
+                offset => return errinput!("invalid offset {offset}"),
+            };
+            node = Node::Offset { source: Box::new(node), offset }
+        }
+
+        // Build LIMIT clause.
+        if let Some(limit) = limit {
+            let limit = match Self::evaluate_constant(limit)? {
+                Value::Integer(limit) if limit >= 0 => limit as usize,
+                limit => return errinput!("invalid limit {limit}"),
+            };
+            node = Node::Limit { source: Box::new(node), limit }
+        }
+
+        // Remove any hidden columns before emitting the result.
+        if let Some(targets) = scope.remap_hidden() {
+            node = Node::Remap { source: Box::new(node), targets }
+        }
+
+        Ok(Plan::Select(node))
+    }
+
+    /// Builds a FROM clause consisting of one or more items. Each item is
+    /// either a table or a join of two or more tables. All items are implicitly
+    /// joined, e.g. "SELECT * FROM a, b" is an implicit full join of a and b.
+    fn build_from_clause(&self, from: Vec<ast::From>, scope: &mut Scope) -> RaftDBResult<Node> {
+        // Build the first FROM item. A FROM clause must have at least one.
+        let mut items = from.into_iter();
+        let mut node = match items.next() {
+            Some(from) => self.build_from(from, scope)?,
+            None => return errinput!("no from items given"),
+        };
+
+        // Build and implicitly join additional items.
+        for from in items {
+            let right = self.build_from(from, scope)?;
+            node = Node::NestedLoopJoin {
+                left: Box::new(node),
+                right: Box::new(right),
+                predicate: None,
+                outer: false,
+            };
+        }
+        Ok(node)
+    }
+
+    /// Builds FROM items, which can either be a single table or a chained join
+    /// of multiple tables, e.g. "SELECT * FROM a LEFT JOIN b ON b.a_id = a.id".
+    fn build_from(&self, from: ast::From, parent_scope: &mut Scope) -> RaftDBResult<Node> {
+        // Each from item is built in its own scope, such that a join node only
+        // sees the columns of its children. It's then merged into the parent.
+        let mut scope = Scope::new();
+
+        let node = match from {
+            // A full table scan.
+            ast::From::Table { name, alias } => {
+                let table = self.catalog.must_get_table(&name)?;
+                scope.add_table(&table, alias.as_deref())?;
+                Node::Scan { table, alias, filter: None }
+            }
+
+            // A two-way join. The left or right nodes may be chained joins.
+            ast::From::Join { mut left, mut right, r#type, predicate } => {
+                // Right joins are built as a left join then column swap.
+                if r#type == ast::JoinType::Right {
+                    (left, right) = (right, left)
+                }
+
+                // Build the left and right nodes.
+                let left = Box::new(self.build_from(*left, &mut scope)?);
+                let right = Box::new(self.build_from(*right, &mut scope)?);
+                let (left_size, right_size) = (left.columns(), right.columns());
+
+                // Build the join node.
+                let predicate = predicate.map(|e| Self::build_expression(e, &scope)).transpose()?;
+                let outer = r#type.is_outer();
+                let mut node = Node::NestedLoopJoin { left, right, predicate, outer };
+
+                // For right joins, swap the columns.
+                if r#type == ast::JoinType::Right {
+                    let size = left_size + right_size;
+                    let targets = (0..size).map(|i| Some((i + right_size) % size)).collect_vec();
+                    scope = scope.remap(&targets);
+                    node = Node::Remap { source: Box::new(node), targets }
+                }
+                node
+            }
+        };
+
+        parent_scope.merge(scope)?;
+        Ok(node)
+    }
+
+    /// Builds an aggregate node, which computes aggregates for a set of GROUP
+    /// BY buckets. The aggregate functions have been collected from the SELECT,
+    /// HAVING, and ORDER BY clauses.
+    ///
+    /// The ast::Expression for each aggregate function and GROUP BY expression
+    /// is tracked in the Scope and mapped to the column index. Later nodes
+    /// (i.e. SELECT, HAVING, and ORDER BY) can look up the column index of
+    /// aggregate expressions while building expressions. Consider e.g.:
+    ///
+    /// SELECT SUM(a) / COUNT(*) FROM t GROUP BY b % 10 HAVING b % 10 >= 5 ORDER BY MAX(c)
+    ///
+    /// This will build an Aggregate node for SUM(a), COUNT(*), MAX(c) bucketed
+    /// by b % 10. The SELECT can look up up SUM(a) and COUNT(*) to compute the
+    /// division, and HAVING can look up b % 10 to compute the predicate.
+    fn build_aggregate(
+        &self,
+        source: Node,
+        mut group_by: Vec<ast::Expression>,
+        mut aggregates: Vec<ast::Expression>,
+        scope: &mut Scope,
+    ) -> RaftDBResult<Node> {
+        // Construct a child scope with the group_by and aggregate AST
+        // expressions, for lookups. Discard duplicate expressions.
+        let mut child_scope = scope.spawn();
+        group_by.retain(|expr| child_scope.add_aggregate(expr, scope).is_some());
+        aggregates.retain(|expr| child_scope.add_aggregate(expr, scope).is_some());
+
+        // Build the node from the remaining unique expressions.
+        let group_by =
+            group_by.into_iter().map(|expr| Self::build_expression(expr, scope)).try_collect()?;
+        let aggregates = aggregates
+            .into_iter()
+            .map(|expr| Self::build_aggregate_function(expr, scope))
+            .try_collect()?;
+
+        *scope = child_scope;
+        Ok(Node::Aggregate { source: Box::new(source), group_by, aggregates })
+    }
+
+    /// Builds an aggregate function from an AST expression.
+    fn build_aggregate_function(expr: ast::Expression, scope: &Scope) -> RaftDBResult<Aggregate> {
+        let ast::Expression::Function(name, mut args) = expr else {
+            panic!("aggregate expression must be function");
+        };
+        if args.len() != 1 {
+            return errinput!("{name} takes 1 argument");
+        }
+        if args[0].contains(&|expr| Self::is_aggregate_function(expr)) {
+            return errinput!("aggregate functions can't be nested");
+        }
+        // Special-case COUNT(*) since expressions don't support tuples.
+        let expr = match (name.as_str(), args.remove(0)) {
+            ("count", ast::Expression::All) => Expression::Constant(Value::Boolean(true)),
+            (_, arg) => Self::build_expression(arg, scope)?,
+        };
+        Ok(match name.as_str() {
+            "avg" => Aggregate::Average(expr),
+            "count" => Aggregate::Count(expr),
+            "min" => Aggregate::Min(expr),
+            "max" => Aggregate::Max(expr),
+            "sum" => Aggregate::Sum(expr),
+            name => return errinput!("unknown aggregate function {name}"),
+        })
+    }
+
+    /// Checks whether a given AST expression is an aggregate function.
+    fn is_aggregate_function(expr: &ast::Expression) -> bool {
+        if let ast::Expression::Function(name, _) = expr {
+            return ["avg", "count", "max", "min", "sum"].contains(&name.as_str());
+        }
+        false
+    }
+
+    /// Collects aggregate functions from SELECT, HAVING, and ORDER BY clauses.
+    fn collect_aggregates(
+        select: &[(ast::Expression, Option<String>)],
+        having: &Option<ast::Expression>,
+        order_by: &[(ast::Expression, ast::Direction)],
+    ) -> Vec<ast::Expression> {
+        let select = select.iter().map(|(expr, _)| expr);
+        let having = having.iter();
+        let order_by = order_by.iter().map(|(expr, _)| expr);
+        let mut aggregates = Vec::new();
+        for expr in select.chain(having).chain(order_by) {
+            expr.collect(&|expr| Self::is_aggregate_function(expr), &mut aggregates)
+        }
+        aggregates
+    }
+
+    /// Builds hidden columns for a projection to pass through columns that are
+    /// used by downstream nodes. Consider e.g.:
+    ///
+    /// SELECT id FROM table ORDER BY value
+    ///
+    /// The ORDER BY node is evaluated after the SELECT projection (it may need
+    /// to order on projected columns), but "value" isn't projected and thus
+    /// isn't available to the ORDER BY node. We add a hidden "value" column to
+    /// the projection to satisfy the ORDER BY.
+    ///
+    /// Hidden columns are tracked in the scope and stripped before the result
+    /// is returned to the client.
+    fn build_select_hidden(
+        &self,
+        having: &Option<ast::Expression>,
+        order_by: &[(ast::Expression, ast::Direction)],
+        scope: &Scope,
+        child_scope: &mut Scope,
+    ) -> Vec<Expression> {
+        let mut hidden = Vec::new();
+        for expr in having.iter().chain(order_by.iter().map(|(expr, _)| expr)) {
+            expr.walk(&mut |expr| {
+                // If this is an aggregate or GROUP BY expression that isn't
+                // already available in the child scope, add a hidden column.
+                if let Some(index) = scope.lookup_aggregate(expr) {
+                    if child_scope.lookup_aggregate(expr).is_none() {
+                        child_scope.add_passthrough(scope, index, true);
+                        hidden.push(Expression::Column(index));
+                        return true;
+                    }
+                }
+
+                // Look for column references that don't exist post-projection,
+                // but that do exist in the parent, and add hidden columns.
+                let ast::Expression::Column(table, column) = expr else {
+                    return true;
+                };
+                if child_scope.lookup_column(table.as_deref(), column).is_ok() {
+                    return true;
+                }
+                let Ok(index) = scope.lookup_column(table.as_deref(), column) else {
+                    // If the parent lookup fails too (i.e. unknown column),
+                    // ignore the error. It will be surfaced during building.
+                    return true;
+                };
+                child_scope.add_passthrough(scope, index, true);
+                hidden.push(Expression::Column(index));
+                true
+            });
+        }
+        hidden
     }
 
     /// Builds an expression from an AST expression, looking up columns and

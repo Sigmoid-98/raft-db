@@ -1,11 +1,11 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
-use itertools::{Either, Itertools as _};
-use raft_db_common::{errinput, RaftDBError, RaftDBResult};
 use crate::engine::Catalog;
 use crate::parser::ast;
-use crate::planner::{Aggregate, Node};
 use crate::planner::plan::{remap_sources, Plan};
+use crate::planner::{Aggregate, Node};
 use crate::types::{self, Column, Expression, Label, Table, Value};
+use itertools::{Either, Itertools as _};
+use raft_db_common::{errinput, RaftDBResult};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 
 /// The planner builds an execution plan from a parsed Abstract Syntax Tree,

@@ -5,5 +5,7 @@ mod plan;
 mod planner;
 mod optimizer;
 
+#[cfg(test)]
+pub use optimizer::OPTIMIZERS;
 pub use plan::{Aggregate, Direction, Node, Plan};
 pub use planner::{Planner, Scope};

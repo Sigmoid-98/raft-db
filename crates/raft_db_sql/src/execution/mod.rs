@@ -3,8 +3,8 @@
 mod aggregate;
 mod execute;
 mod join;
+mod source;
 mod transform;
 mod write;
-mod source;
 
 pub use execute::{ExecutionResult, execute_plan};
